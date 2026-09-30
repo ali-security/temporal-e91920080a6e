@@ -10,6 +10,8 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence/sql"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/mysql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
@@ -75,20 +77,23 @@ func TestBuildQueryParams(t *testing.T) {
 			t.Run(tcName, func(t *testing.T) {
 				r := require.New(t)
 				ctrl := gomock.NewController(t)
-				sqlQC, err := NewSQLQueryConverter(pluginName)
-				r.NoError(err)
+				mockDB := sqlplugin.NewMockDB(ctrl)
+				mockDB.EXPECT().PluginName().Return(pluginName)
+				mockDB.EXPECT().DbName().Return("test-db")
+				visStore := &VisibilityStore{
+					sqlStore:                       sql.SqlStore{DB: mockDB},
+					searchAttributesProvider:       searchattribute.NewTestProvider(),
+					searchAttributesMapperProvider: searchattribute.NewTestMapperProvider(&searchattribute.TestMapper{}),
+					metricsHandler:                 metrics.NewMockHandler(ctrl),
+					logger:                         log.NewNoopLogger(),
+				}
 
-				qp, err := buildQueryParams(
-					testNamespaceID,
+				qp, err := visStore.buildQueryParams(
 					testNamespaceName,
-					tc.query,
-					sqlQC,
-					searchattribute.TestNameTypeMap(),
-					&searchattribute.TestMapper{},
+					testNamespaceID,
 					nil, // chasmMapper
 					chasm.UnspecifiedArchetypeID,
-					metrics.NewMockHandler(ctrl),
-					log.NewNoopLogger(),
+					tc.query,
 				)
 				if tc.err != "" {
 					r.Error(err)

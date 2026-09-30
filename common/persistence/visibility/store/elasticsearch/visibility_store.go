@@ -373,17 +373,29 @@ func (s *VisibilityStore) ListWorkflowExecutions(
 	ctx context.Context,
 	request *manager.ListWorkflowExecutionsRequestV2,
 ) (*store.InternalListExecutionsResponse, error) {
-	p, err := s.BuildSearchParametersV2(request, s.GetListFieldSorter)
+	p, err := s.buildSearchParametersInternal(&searchParametersInternal{
+		NamespaceName: request.Namespace,
+		NamespaceID:   request.NamespaceID,
+		Query:         request.Query,
+		PageSize:      request.PageSize,
+		NextPageToken: request.NextPageToken,
+		ChasmMapper:   nil,
+		ArchetypeID:   chasm.UnspecifiedArchetypeID,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	searchResult, err := s.esClient.Search(ctx, p)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("ListWorkflowExecutions failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(
+			metrics.VisibilityPersistenceListWorkflowExecutionsScope,
+			err,
+			s.logger,
+		)
 	}
 
-	return s.GetListWorkflowExecutionsResponse(searchResult, request.Namespace, request.PageSize, nil)
+	return s.GetListWorkflowExecutionsResponse(searchResult, request.PageSize, nil)
 }
 
 func (s *VisibilityStore) ListChasmExecutions(
@@ -396,22 +408,29 @@ func (s *VisibilityStore) ListChasmExecutions(
 	}
 	chasmMapper := rc.SearchAttributesMapper()
 
-	p, err := s.BuildChasmSearchParameters(request, s.GetListFieldSorter, chasmMapper)
+	p, err := s.buildSearchParametersInternal(&searchParametersInternal{
+		NamespaceName: namespace.Name(request.Namespace),
+		NamespaceID:   namespace.ID(request.NamespaceId),
+		Query:         request.Query,
+		PageSize:      int(request.PageSize),
+		NextPageToken: request.NextPageToken,
+		ChasmMapper:   chasmMapper,
+		ArchetypeID:   request.ArchetypeId,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	searchResult, err := s.esClient.Search(ctx, p)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("ListChasmExecutions failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(
+			metrics.VisibilityPersistenceListChasmExecutionsScope,
+			err,
+			s.logger,
+		)
 	}
 
-	return s.GetListWorkflowExecutionsResponse(
-		searchResult,
-		namespace.Name(request.Namespace),
-		int(request.PageSize),
-		chasmMapper,
-	)
+	return s.GetListWorkflowExecutionsResponse(searchResult, int(request.PageSize), chasmMapper)
 }
 
 func (s *VisibilityStore) CountChasmExecutions(
@@ -422,13 +441,13 @@ func (s *VisibilityStore) CountChasmExecutions(
 	if !ok {
 		return nil, serviceerror.NewInvalidArgumentf("unknown archetype ID: %d", request.ArchetypeId)
 	}
-	mapper := rc.SearchAttributesMapper()
+	chasmMapper := rc.SearchAttributesMapper()
 
 	queryParams, err := s.convertQuery(
 		namespace.Name(request.Namespace),
 		namespace.ID(request.NamespaceId),
 		request.Query,
-		mapper,
+		chasmMapper,
 		request.ArchetypeId,
 	)
 	if err != nil {
@@ -436,12 +455,21 @@ func (s *VisibilityStore) CountChasmExecutions(
 	}
 
 	if len(queryParams.GroupBy) > 0 {
-		return s.countGroupByExecutions(ctx, queryParams, mapper)
+		return s.countGroupByExecutions(
+			ctx,
+			queryParams,
+			chasmMapper,
+			metrics.VisibilityPersistenceCountChasmExecutionsScope,
+		)
 	}
 
 	count, err := s.esClient.Count(ctx, s.index, queryParams.Query)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("CountChasmExecutions failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(
+			metrics.VisibilityPersistenceCountChasmExecutionsScope,
+			err,
+			s.logger,
+		)
 	}
 
 	return &store.InternalCountExecutionsResponse{Count: count}, nil
@@ -455,7 +483,7 @@ func (s *VisibilityStore) CountWorkflowExecutions(
 		request.Namespace,
 		request.NamespaceID,
 		request.Query,
-		nil,
+		nil, // chasmMapper
 		chasm.UnspecifiedArchetypeID,
 	)
 	if err != nil {
@@ -463,12 +491,21 @@ func (s *VisibilityStore) CountWorkflowExecutions(
 	}
 
 	if len(queryParams.GroupBy) > 0 {
-		return s.countGroupByExecutions(ctx, queryParams, nil)
+		return s.countGroupByExecutions(
+			ctx,
+			queryParams,
+			nil, // chasmMapper
+			metrics.VisibilityPersistenceCountWorkflowExecutionsScope,
+		)
 	}
 
 	count, err := s.esClient.Count(ctx, s.index, queryParams.Query)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("CountWorkflowExecutions failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(
+			metrics.VisibilityPersistenceCountWorkflowExecutionsScope,
+			err,
+			s.logger,
+		)
 	}
 
 	return &store.InternalCountExecutionsResponse{Count: count}, nil
@@ -491,6 +528,7 @@ func (s *VisibilityStore) countGroupByExecutions(
 	ctx context.Context,
 	queryParams *esQueryParams,
 	chasmMapper *chasm.VisibilitySearchAttributesMapper,
+	operation string,
 ) (*store.InternalCountExecutionsResponse, error) {
 	groupByFields := queryParams.GroupBy
 
@@ -525,7 +563,7 @@ func (s *VisibilityStore) countGroupByExecutions(
 		termsAgg,
 	)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("CountWorkflowExecutions failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(operation, err, s.logger)
 	}
 	return s.parseCountGroupByResponse(esResponse, groupByFields, chasmMapper)
 }
@@ -537,7 +575,11 @@ func (s *VisibilityStore) GetWorkflowExecution(
 	docID := GetDocID(request.WorkflowID, request.RunID)
 	result, err := s.esClient.Get(ctx, s.index, docID)
 	if err != nil {
-		return nil, ConvertElasticsearchClientError("GetWorkflowExecution failed", err, s.logger)
+		return nil, ConvertElasticsearchClientError(
+			metrics.VisibilityPersistenceGetWorkflowExecutionScope,
+			err,
+			s.logger,
+		)
 	}
 
 	typeMap, err := s.searchAttributesProvider.GetSearchAttributes(s.index, false)
@@ -553,7 +595,7 @@ func (s *VisibilityStore) GetWorkflowExecution(
 		)
 	}
 
-	workflowExecutionInfo, err := s.ParseESDoc(result.Id, result.Source, typeMap, request.Namespace, nil)
+	workflowExecutionInfo, err := s.ParseESDoc(result.Id, result.Source, typeMap, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -561,37 +603,6 @@ func (s *VisibilityStore) GetWorkflowExecution(
 	return &store.InternalGetWorkflowExecutionResponse{
 		Execution: workflowExecutionInfo,
 	}, nil
-}
-
-func (s *VisibilityStore) BuildSearchParametersV2(
-	request *manager.ListWorkflowExecutionsRequestV2,
-	getFieldSorter func([]elastic.Sorter) ([]elastic.Sorter, error),
-) (*client.SearchParameters, error) {
-	return s.buildSearchParametersInternal(&searchParametersInternal{
-		NamespaceName: request.Namespace,
-		NamespaceID:   request.NamespaceID,
-		Query:         request.Query,
-		PageSize:      request.PageSize,
-		NextPageToken: request.NextPageToken,
-		ChasmMapper:   nil,
-		ArchetypeID:   chasm.UnspecifiedArchetypeID,
-	})
-}
-
-func (s *VisibilityStore) BuildChasmSearchParameters(
-	request *visibilityservice.ListChasmExecutionsRequest,
-	getFieldSorter func([]elastic.Sorter) ([]elastic.Sorter, error),
-	chasmMapper *chasm.VisibilitySearchAttributesMapper,
-) (*client.SearchParameters, error) {
-	return s.buildSearchParametersInternal(&searchParametersInternal{
-		NamespaceName: namespace.Name(request.Namespace),
-		NamespaceID:   namespace.ID(request.NamespaceId),
-		Query:         request.Query,
-		PageSize:      int(request.PageSize),
-		NextPageToken: request.NextPageToken,
-		ChasmMapper:   chasmMapper,
-		ArchetypeID:   request.ArchetypeId,
-	})
 }
 
 func (s *VisibilityStore) buildSearchParametersInternal(
@@ -790,7 +801,6 @@ func (s *VisibilityStore) GetListFieldSorter(fieldSorts []elastic.Sorter) ([]ela
 
 func (s *VisibilityStore) GetListWorkflowExecutionsResponse(
 	searchResult *elastic.SearchResult,
-	namespace namespace.Name,
 	pageSize int,
 	chasmMapper *chasm.VisibilitySearchAttributesMapper,
 ) (*store.InternalListExecutionsResponse, error) {
@@ -808,7 +818,7 @@ func (s *VisibilityStore) GetListWorkflowExecutionsResponse(
 	}
 	var lastHitSort []any
 	for _, hit := range searchResult.Hits.Hits {
-		workflowExecutionInfo, err := s.ParseESDoc(hit.Id, hit.Source, typeMap, namespace, chasmMapper)
+		workflowExecutionInfo, err := s.ParseESDoc(hit.Id, hit.Source, typeMap, chasmMapper)
 		if err != nil {
 			return nil, err
 		}
@@ -945,7 +955,6 @@ func (s *VisibilityStore) ParseESDoc(
 	docID string,
 	docSource json.RawMessage,
 	saTypeMap searchattribute.NameTypeMap,
-	namespaceName namespace.Name,
 	chasmMapper *chasm.VisibilitySearchAttributesMapper,
 ) (*store.InternalExecutionInfo, error) {
 	logParseError := func(fieldName string, fieldValue any, err error, docID string) error {
@@ -1221,8 +1230,9 @@ func finishParseJSONValue(val any, t enumspb.IndexedValueType) (any, error) {
 	panic(fmt.Sprintf("Unknown field type: %v", t))
 }
 
-func ConvertElasticsearchClientError(message string, err error, logger log.Logger) error {
+func ConvertElasticsearchClientError(operation string, err error, logger log.Logger) error {
 	// This message is returned to client, avoiding including too much details.
+	message := operation + " failed"
 	errMessage := fmt.Sprintf("%s: %s", message, shortErrorMessage(err))
 	var elasticErr *elastic.Error
 	switch {
