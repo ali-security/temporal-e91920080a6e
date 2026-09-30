@@ -29,6 +29,7 @@ type (
 )
 
 var _ manager.VisibilityManager = (*VisibilityManagerDual)(nil)
+var _ manager.AdminVisibilityManager = (*VisibilityManagerDual)(nil)
 
 // NewVisibilityManagerDual create a visibility manager that operate on multiple manager
 // implementations based on dynamic config.
@@ -216,6 +217,32 @@ func (v *VisibilityManagerDual) AddSearchAttributes(
 		return err
 	}
 	return v.secondaryVisibilityManager.AddSearchAttributes(ctx, request)
+}
+
+// ListExecutions implements [manager.AdminVisibilityManager].
+func (m *VisibilityManagerDual) ListExecutions(
+	ctx context.Context,
+	request *manager.AdminListExecutionsRequest,
+) (*manager.AdminListExecutionsResponse, error) {
+	readManager := m.managerSelector.readManager(request.Namespace)
+	adminReadManager, ok := readManager.(manager.AdminVisibilityManager)
+	if !ok {
+		return nil, manager.ErrNotAdminVisibilityManager
+	}
+	return adminReadManager.ListExecutions(ctx, request)
+}
+
+// CountExecutions implements [manager.AdminVisibilityManager].
+func (m *VisibilityManagerDual) CountExecutions(
+	ctx context.Context,
+	request *manager.AdminCountExecutionsRequest,
+) (*manager.AdminCountExecutionsResponse, error) {
+	readManager := m.managerSelector.readManager(request.Namespace)
+	adminReadManager, ok := readManager.(manager.AdminVisibilityManager)
+	if !ok {
+		return nil, manager.ErrNotAdminVisibilityManager
+	}
+	return adminReadManager.CountExecutions(ctx, request)
 }
 
 func dualWriteWrapper[RequestT any](

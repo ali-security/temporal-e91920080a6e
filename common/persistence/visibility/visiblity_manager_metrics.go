@@ -16,6 +16,7 @@ import (
 )
 
 var _ manager.VisibilityManager = (*visibilityManagerMetrics)(nil)
+var _ manager.AdminVisibilityManager = (*visibilityManagerMetrics)(nil)
 
 type visibilityManagerMetrics struct {
 	metricHandler metrics.Handler
@@ -229,6 +230,30 @@ func (m *visibilityManagerMetrics) AddSearchAttributes(
 	metrics.VisibilityPersistenceLatency.With(handler).Record(elapsed)
 	metrics.ContextCounterAdd(ctx, metrics.TaskPersistenceLatency.Name(), elapsed.Nanoseconds())
 	return m.updateErrorMetric(handler, err)
+}
+
+// ListExecutions implements [manager.AdminVisibilityManager].
+func (m *visibilityManagerMetrics) ListExecutions(
+	ctx context.Context,
+	request *manager.AdminListExecutionsRequest,
+) (*manager.AdminListExecutionsResponse, error) {
+	adminManager, ok := m.delegate.(manager.AdminVisibilityManager)
+	if !ok {
+		return nil, manager.ErrNotAdminVisibilityManager
+	}
+	return adminManager.ListExecutions(ctx, request)
+}
+
+// CountExecutions implements [manager.AdminVisibilityManager].
+func (m *visibilityManagerMetrics) CountExecutions(
+	ctx context.Context,
+	request *manager.AdminCountExecutionsRequest,
+) (*manager.AdminCountExecutionsResponse, error) {
+	adminManager, ok := m.delegate.(manager.AdminVisibilityManager)
+	if !ok {
+		return nil, manager.ErrNotAdminVisibilityManager
+	}
+	return adminManager.CountExecutions(ctx, request)
 }
 
 func (m *visibilityManagerMetrics) tagScope(operation string) (metrics.Handler, time.Time) {

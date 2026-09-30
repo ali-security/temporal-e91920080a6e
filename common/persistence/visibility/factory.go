@@ -126,6 +126,7 @@ func newVisibilityManager(
 		visStore,
 		params.Logger,
 		params.SearchAttributesMapperProvider,
+		params.NamespaceRegistry,
 		params.ChasmRegistry,
 	)
 
@@ -184,6 +185,7 @@ func newVisibilityStoreFromDataStoreConfig(
 			params.PersistenceResolver,
 			params.SearchAttributesProvider,
 			params.SearchAttributesMapperProvider,
+			params.NamespaceRegistry,
 			params.ChasmRegistry,
 			config.EnableUnifiedQueryConverter,
 			params.Logger,
@@ -196,6 +198,7 @@ func newVisibilityStoreFromDataStoreConfig(
 			config.EsProcessorConfig,
 			params.SearchAttributesProvider,
 			params.SearchAttributesMapperProvider,
+			params.NamespaceRegistry,
 			params.ChasmRegistry,
 			config.DisableOrderByClause,
 			config.EnableManualPagination,

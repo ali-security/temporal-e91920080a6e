@@ -91,7 +91,7 @@ type (
 		config                     *Config
 		namespaceDLQHandler        nsreplication.DLQMessageHandler
 		eventSerializer            serialization.Serializer
-		visibilityMgr              manager.VisibilityManager
+		visibilityMgr              manager.AdminVisibilityManager
 		persistenceExecutionName   string
 		namespaceReplicationQueue  persistence.NamespaceReplicationQueue
 		taskManager                persistence.TaskManager
@@ -123,7 +123,7 @@ type (
 		Config                              *Config
 		NamespaceReplicationQueue           persistence.NamespaceReplicationQueue
 		ReplicatorNamespaceReplicationQueue persistence.NamespaceReplicationQueue
-		visibilityMgr                       manager.VisibilityManager
+		visibilityMgr                       manager.AdminVisibilityManager
 		Logger                              log.Logger
 		EventLogger                         otellog.Logger
 		TaskManager                         persistence.TaskManager
@@ -2340,4 +2340,46 @@ func (adh *AdminHandler) migrateScheduleToWorkflow(
 		return nil, err
 	}
 	return &adminservice.MigrateScheduleResponse{}, nil
+}
+
+func (adh *AdminHandler) ListExecutions(
+	ctx context.Context,
+	request *adminservice.ListExecutionsRequest,
+) (*adminservice.ListExecutionsResponse, error) {
+	resp, err := adh.visibilityMgr.ListExecutions(
+		ctx, &manager.AdminListExecutionsRequest{
+			Namespace:     namespace.Name(request.GetNamespace()),
+			Query:         request.GetQuery(),
+			PageSize:      int(request.GetPageSize()),
+			NextPageToken: request.GetNextPageToken(),
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &adminservice.ListExecutionsResponse{
+		Executions:    resp.Executions,
+		NextPageToken: resp.NextPageToken,
+	}, nil
+}
+
+func (adh *AdminHandler) CountExecutions(
+	ctx context.Context,
+	request *adminservice.CountExecutionsRequest,
+) (*adminservice.CountExecutionsResponse, error) {
+	resp, err := adh.visibilityMgr.CountExecutions(
+		ctx, &manager.AdminCountExecutionsRequest{
+			Namespace: namespace.Name(request.GetNamespace()),
+			Query:     request.GetQuery(),
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &adminservice.CountExecutionsResponse{
+		Count:  resp.Count,
+		Groups: resp.Groups,
+	}, nil
 }
