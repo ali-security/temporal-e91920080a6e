@@ -36,8 +36,13 @@ import (
 var shardSalt string
 
 var (
-	_                  Env = (*TestEnv)(nil)
-	defaultTestTimeout     = 90 * time.Second * debug.TimeoutMultiplier
+	_ Env = (*TestEnv)(nil)
+	// sealed-libraries: upstream's 90s is tuned for its 8-core CI runners. On the
+	// 4-core/16GB GitHub runner this build uses, FunctionalTestBase.TearDownCluster
+	// ("context deadline exceeded" out of MarkNamespaceAsDeleted / TearDownCluster)
+	// overruns it after every subtest has already passed, failing the whole suite on
+	// the first attempt. Raised so the same work simply gets the time it needs.
+	defaultTestTimeout = 240 * time.Second * debug.TimeoutMultiplier
 )
 
 type Env interface {

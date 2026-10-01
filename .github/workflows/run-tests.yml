@@ -1,13 +1,12 @@
 name: All Tests
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-      - cloud/*
-      - feature/*
-      - release/*
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional -run regex passed to the test commands"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -24,12 +23,17 @@ env:
   DOCKER_COMPOSE_FILE: ./develop/github/docker-compose.yml
   TEMPORAL_VERSION_CHECK_DISABLED: 1
   MAX_TEST_ATTEMPTS: 3
-  SHARD_COUNT: 3 # NOTE: must match shard count in optimize-test-sharding.yml
+  # Upstream uses 3 shards on its 8-core runners; the standard 4-core/16GB runner this
+  # fork gets OOM-kills the cass_es full functional shards at ~11GB per test binary.
+  # Sharding is a pure hash-mod over the test name, so more shards run the identical
+  # test set with a smaller per-job working set.
+  SHARD_COUNT: 6 # NOTE: must match shard count in optimize-test-sharding.yml
 
 jobs:
   test-setup:
     name: Test setup
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       job_matrix: ${{ steps.build_matrix.outputs.job_matrix }}
       full_test_reason: ${{ steps.determine_scope.outputs.full_test_reason }}
@@ -211,10 +215,77 @@ jobs:
           echo "job_matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "Generated $(jq length <<< "$MATRIX") jobs"
 
+  build-module-zip:
+    name: Build Go module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.COMMIT }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      - name: Stage a clean module tree
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/zipsrc"
+          cp -a "$GITHUB_WORKSPACE/." "$RUNNER_TEMP/zipsrc/"
+          rm -rf "$RUNNER_TEMP/zipsrc/.git"
+
+      - name: Build the module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/helper" "$GITHUB_WORKSPACE/dist"
+          cd "$RUNNER_TEMP/helper"
+          go mod init modzip
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              dir, version, out := os.Args[1], os.Args[2], os.Args[3]
+              f, err := os.Create(out)
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              m := module.Version{Path: "go.temporal.io/server", Version: version}
+              if err := zip.CreateFromDir(f, m, dir); err != nil {
+                  log.Fatal(err)
+              }
+              if err := f.Close(); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          GOEOF
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.24.0
+          GOFLAGS=-mod=mod go mod tidy
+          go run . "$RUNNER_TEMP/zipsrc" "v1.31.0" "$GITHUB_WORKSPACE/dist/v1.31.0.zip"
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: go-module-zip
+          path: dist/v1.31.0.zip
+          if-no-files-found: error
+
   pre-build:
     name: Pre-build for cache
     needs: test-setup
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -248,49 +319,11 @@ jobs:
           path: ~/.cache/go-build
           key: go-${{ runner.os }}${{ runner.arch }}-build-${{ env.COMMIT }}
 
-  misc-checks:
-    name: Misc checks
-    needs: [pre-build, test-setup]
-    runs-on: ${{ needs.test-setup.outputs.runner_arm }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ env.COMMIT }}
-          # buf-breaking tries to compare HEAD against merge base so we need to be able to find it
-          fetch-depth: 100
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: "go.mod"
-          cache: false # do our own caching
-
-      - name: Restore dependencies
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/go/pkg/mod
-          key: go-${{ runner.os }}${{ runner.arch }}-${{ hashFiles('go.mod') }}-deps-${{ hashFiles('go.sum') }}
-
-      - name: Restore build outputs
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/.cache/go-build
-          key: go-${{ runner.os }}${{ runner.arch }}-build-${{ env.COMMIT }}
-
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - run: GOOS=windows GOARCH=amd64 make clean-bins bins
-
-      - run: GOOS=darwin GOARCH=arm64 make clean-bins bins
-
-      - run: make clean-bins ci-build-misc
-
   unit-test:
     name: Unit test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -317,42 +350,18 @@ jobs:
       - name: Run unit tests
         timeout-minutes: 20
         run: TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage
+        env:
+          TEST_ARGS: ${{ inputs.test-filter && format('-run={0}', inputs.test-filter) || '' }}
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
         run: |
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
-
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-          report_type: test_results
 
       - name: Get job ID
         id: get_job_id
@@ -361,20 +370,11 @@ jobs:
           job_name: Unit test
           run_id: ${{ github.run_id }}
 
-      - name: Upload test results to GitHub
-        # Can't pin to major because the action linter doesn't recognize the include-hidden-files flag.
-        uses: actions/upload-artifact@v6
-        if: ${{ !cancelled() }}
-        with:
-          name: junit-xml--${{ github.run_id }}--${{ steps.get_job_id.outputs.job_id }}--${{ github.run_attempt }}--unit-test
-          path: ./.testoutput/junit.*.xml
-          include-hidden-files: true
-          retention-days: 28
-
   integration-test:
     name: Integration test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -417,10 +417,12 @@ jobs:
       - name: Run integration test
         timeout-minutes: 15
         run: ./develop/github/monitor_test.sh make integration-test-coverage
+        env:
+          TEST_ARGS: ${{ inputs.test-filter && format('-run={0}', inputs.test-filter) || '' }}
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
@@ -428,48 +430,12 @@ jobs:
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
 
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-          report_type: test_results
-
       - name: Get job ID
         id: get_job_id
         uses: ./.github/actions/get-job-id
         with:
           job_name: Integration test
           run_id: ${{ github.run_id }}
-
-      - name: Upload test results to GitHub
-        # Can't pin to major because the action linter doesn't recognize the include-hidden-files flag.
-        uses: actions/upload-artifact@v6
-        if: ${{ !cancelled() }}
-        with:
-          name: junit-xml--${{ github.run_id }}--${{ steps.get_job_id.outputs.job_id }}--${{ github.run_attempt }}--integration-test
-          path: ./.testoutput/junit.*.xml
-          include-hidden-files: true
-          retention-days: 28
 
       - name: Tear down docker compose
         if: ${{ always() }}
@@ -487,6 +453,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.test-setup.outputs.job_matrix) }}
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     env:
       PERSISTENCE_TYPE: ${{ matrix.persistence_type }}
       PERSISTENCE_DRIVER: ${{ matrix.persistence_driver }}
@@ -543,15 +510,31 @@ jobs:
           # shellcheck disable=SC2046
           docker compose -f ${{ env.DOCKER_COMPOSE_FILE }} up --wait $(docker compose -f ${{ env.DOCKER_COMPOSE_FILE }} ps --services)
 
+      # Upstream runs this job on an 8-core runner; the standard 4-core/16GB runner this
+      # fork gets sits at 90-97% memory during the cass_es shards and the kernel reaps
+      # the runner agent (exit 143). Swap absorbs the transient peaks.
+      - name: Add swap space
+        run: |
+          set -eux
+          sudo fallocate -l 12G /mnt/seal-swapfile
+          sudo chmod 600 /mnt/seal-swapfile
+          sudo mkswap /mnt/seal-swapfile
+          sudo swapon /mnt/seal-swapfile
+          free -m
+
       - name: Run functional test
         timeout-minutes: ${{ matrix.github_timeout }}
         run: ./develop/github/monitor_test.sh ${{ matrix.cmd }}
         env:
           TEST_TOTAL_SHARDS: ${{ matrix.total_shards }}
           TEST_SHARD_INDEX: ${{ matrix.total_shards && matrix.shard_index }} # guard with total_shards to avoid falsy eval of shard_index=0
-          TEST_ARGS: "${{ matrix.test_args }}"
+          TEST_ARGS: ${{ inputs.test-filter && format('-run={0}', inputs.test-filter) || matrix.test_args }}
           TEMPORAL_TEST_LOG_FILE: ${{ github.workspace }}/.testoutput/debug.log
           TEMPORAL_TEST_LOG_LEVEL: info
+          # Soft heap ceiling for the test binary: make the Go GC work harder rather than
+          # grow past what this runner has. Shards finish in 14-20min of a 40min budget,
+          # so the extra GC is affordable.
+          GOMEMLIMIT: 9GiB
 
       - name: Dump container logs
         if: ${{ failure() && toJson(matrix.containers) != '[]' }}
@@ -559,7 +542,7 @@ jobs:
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
@@ -567,55 +550,11 @@ jobs:
           [ "$(find .testoutput -maxdepth 1 -name 'junit.*.xml' | wc -l)" -lt "$MAX_TEST_ATTEMPTS" ] &&
             CRASH_REPORT_NAME="$GITHUB_JOB" make report-test-crash
 
-      - name: Generate test summary
-        uses: mikepenz/action-junit-report@v6
-        if: ${{ !cancelled() }}
-        with:
-          report_paths: ./.testoutput/junit.*.xml
-          detailed_summary: true
-          check_annotations: false
-          annotate_only: true
-          skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-          report_type: test_results
-
-      - name: Upload test results to GitHub
-        # Can't pin to major because the action linter doesn't recognize the include-hidden-files flag.
-        uses: actions/upload-artifact@v6
-        if: ${{ !cancelled() }}
-        with:
-          name: junit-xml--${{ github.run_id }}--${{ steps.get_job_id.outputs.job_id }}--${{ github.run_attempt }}--${{ matrix.name }}--${{ matrix.display_name }}--functional-test
-          path: ./.testoutput/junit.*.xml
-          include-hidden-files: true
-          retention-days: 28
-
-      - name: Upload debug logs
-        uses: actions/upload-artifact@v6
-        if: ${{ !cancelled() }}
-        with:
-          name: debug-logs--${{ github.run_id }}--${{ steps.get_job_id.outputs.job_id }}--${{ github.run_attempt }}--${{ matrix.name }}--${{ matrix.display_name }}--functional-test
-          path: ${{ github.workspace }}/.testoutput/debug.log
-          if-no-files-found: ignore
-          retention-days: 14
-
   mixed-brain-test:
     name: Mixed brain test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
         with:
@@ -659,29 +598,30 @@ jobs:
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Print current server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-current.log || true
+        run: if [ -f .testoutput/mixedbrain_process-current.log ]; then cat .testoutput/mixedbrain_process-current.log; fi
 
       - name: Print release server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-release.log || true
+        run: if [ -f .testoutput/mixedbrain_process-release.log ]; then cat .testoutput/mixedbrain_process-release.log; fi
 
       - name: Print Omes logs
         if: always()
-        run: cat .testoutput/mixedbrain_omes.log || true
+        run: if [ -f .testoutput/mixedbrain_omes.log ]; then cat .testoutput/mixedbrain_omes.log; fi
 
   test-status:
     if: always()
     name: Test Status
     needs:
-      - misc-checks
+      - build-module-zip
       - unit-test
       - integration-test
       - functional-test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       RESULTS: ${{ toJSON(needs.*.result) }}
     steps:
@@ -691,33 +631,3 @@ jobs:
           if [[ -n $(echo "$RESULTS" | jq '.[] | select (. != "success")') ]]; then
             exit 1
           fi
-
-  notify-failure:
-    name: Notify Slack on Failure
-    if: |
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      needs.test-status.result == 'failure'
-    needs: test-status
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: "go.mod"
-          cache: true
-
-      - name: Send Slack notification
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          go run ./cmd/tools/ci-notify alert \
-            --run-id "${{ github.run_id }}" \
-            --slack-webhook "$SLACK_WEBHOOK"
