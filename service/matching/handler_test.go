@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -19,6 +20,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/service/matching/workers"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -246,4 +248,196 @@ func TestWorkerHeartbeatToListInfo_AllFieldsSet(t *testing.T) {
 			)
 		}
 	}
+}
+
+// indexPageByCursor reproduces the class of bug the matching handler's panic
+// handlers exist to contain: a cursor that arrives straight off the wire (a page
+// token, a worker instance key, a namespace id, a task queue name) is trusted as
+// a slice index without being bounds-checked. Any non-empty cursor indexes past
+// the end of the page and raises a genuine Go runtime panic. Without a recover
+// in the handler, that panic unwinds out of the gRPC handler goroutine and takes
+// the whole matching service process down — a remote, unauthenticated crash.
+func indexPageByCursor(cursor []byte) string {
+	page := []string{"worker-0"}
+	return page[len(cursor)]
+}
+
+// panickingWorkersRegistry is a workers.Registry whose methods route the
+// caller-supplied cursor into indexPageByCursor, so the panic is reachable from
+// the handler APIs that go through h.workersRegistry.
+type panickingWorkersRegistry struct{}
+
+func (r *panickingWorkersRegistry) RecordWorkerHeartbeats(
+	nsID namespace.ID, _ namespace.Name, _ []*workerpb.WorkerHeartbeat,
+) {
+	_ = indexPageByCursor([]byte(nsID.String()))
+}
+
+func (r *panickingWorkersRegistry) ListWorkers(
+	_ namespace.ID, params workers.ListWorkersParams,
+) (workers.ListWorkersResponse, error) {
+	_ = indexPageByCursor(params.NextPageToken)
+	return workers.ListWorkersResponse{}, nil
+}
+
+func (r *panickingWorkersRegistry) DescribeWorker(
+	_ namespace.ID, workerInstanceKey string,
+) (*workerpb.WorkerHeartbeat, error) {
+	_ = indexPageByCursor([]byte(workerInstanceKey))
+	return &workerpb.WorkerHeartbeat{}, nil
+}
+
+// panickingEngine is a stub Engine for the handler APIs that forward to the
+// engine. It embeds the Engine interface so only the methods under test need to
+// be implemented.
+type panickingEngine struct {
+	Engine // embedded to satisfy all other interface methods (will panic if called)
+}
+
+func (e *panickingEngine) UpdateFairnessState(
+	_ context.Context, request *matchingservice.UpdateFairnessStateRequest,
+) (*matchingservice.UpdateFairnessStateResponse, error) {
+	_ = indexPageByCursor([]byte(request.GetTaskQueue()))
+	return &matchingservice.UpdateFairnessStateResponse{}, nil
+}
+
+func (e *panickingEngine) UpdateTaskQueueConfig(
+	_ context.Context, request *matchingservice.UpdateTaskQueueConfigRequest,
+) (*matchingservice.UpdateTaskQueueConfigResponse, error) {
+	_ = indexPageByCursor([]byte(request.GetNamespaceId()))
+	return &matchingservice.UpdateTaskQueueConfigResponse{}, nil
+}
+
+// newPanickingTestHandler builds a Handler whose engine and workers registry both
+// panic on any non-empty cursor.
+func newPanickingTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	nsRegistry := namespace.NewMockRegistry(ctrl)
+	nsRegistry.EXPECT().GetNamespaceByID(gomock.Any()).Return(nil, assert.AnError).AnyTimes()
+
+	h := &Handler{
+		engine:            &panickingEngine{},
+		config:            NewConfig(dynamicconfig.NewNoopCollection()),
+		metricsHandler:    metrics.NoopMetricsHandler,
+		logger:            log.NewNoopLogger(),
+		throttledLogger:   log.NewNoopLogger(),
+		namespaceRegistry: nsRegistry,
+		workersRegistry:   &panickingWorkersRegistry{},
+	}
+	// Mark handler as started so requests are served.
+	h.startWG.Add(1)
+	h.startWG.Done()
+
+	return h
+}
+
+// requireCapturedPanic asserts that the handler turned the downstream runtime
+// panic into an Internal service error instead of letting it escape.
+func requireCapturedPanic(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err, "the recovered panic must be reported back as an error")
+	var internalErr *serviceerror.Internal
+	require.ErrorAs(t, err, &internalErr,
+		"captured panic must surface as *serviceerror.Internal, got %T: %v", err, err)
+	require.Contains(t, internalErr.Error(), "index out of range",
+		"error must carry the recovered runtime panic, got: %v", internalErr)
+}
+
+// TestWorkerHandlersCapturePanicFromDownstream is the regression test for the
+// missing panic handlers on the matching worker APIs. Each subtest sends a
+// request whose attacker-controlled cursor makes the layer below the handler
+// panic; the handler must recover it and answer with an Internal error rather
+// than crashing the matching service. Without the `defer log.CapturePanic`
+// guards on these methods, every subtest panics out of the handler call.
+func TestWorkerHandlersCapturePanicFromDownstream(t *testing.T) {
+	// A forged, non-empty cursor is what pushes the index past the end of the page.
+	const maliciousCursor = `{"LastWorkerInstanceKey":"worker-99999999"}`
+
+	t.Run("ListWorkers", func(t *testing.T) {
+		h := newPanickingTestHandler(t)
+
+		var (
+			resp *matchingservice.ListWorkersResponse
+			err  error
+		)
+		require.NotPanics(t, func() {
+			resp, err = h.ListWorkers(context.Background(), &matchingservice.ListWorkersRequest{
+				NamespaceId: "test-ns-id",
+				ListRequest: &workflowservice.ListWorkersRequest{
+					NextPageToken: []byte(maliciousCursor),
+				},
+			})
+		}, "a panic below ListWorkers must not escape the matching handler")
+		require.Nil(t, resp)
+		requireCapturedPanic(t, err)
+	})
+
+	t.Run("DescribeWorker", func(t *testing.T) {
+		h := newPanickingTestHandler(t)
+
+		var (
+			resp *matchingservice.DescribeWorkerResponse
+			err  error
+		)
+		require.NotPanics(t, func() {
+			resp, err = h.DescribeWorker(context.Background(), &matchingservice.DescribeWorkerRequest{
+				NamespaceId: "test-ns-id",
+				Request: &workflowservice.DescribeWorkerRequest{
+					WorkerInstanceKey: maliciousCursor,
+				},
+			})
+		}, "a panic below DescribeWorker must not escape the matching handler")
+		require.Nil(t, resp)
+		requireCapturedPanic(t, err)
+	})
+
+	t.Run("RecordWorkerHeartbeat", func(t *testing.T) {
+		h := newPanickingTestHandler(t)
+
+		var (
+			resp *matchingservice.RecordWorkerHeartbeatResponse
+			err  error
+		)
+		require.NotPanics(t, func() {
+			resp, err = h.RecordWorkerHeartbeat(context.Background(), &matchingservice.RecordWorkerHeartbeatRequest{
+				NamespaceId: maliciousCursor,
+			})
+		}, "a panic below RecordWorkerHeartbeat must not escape the matching handler")
+		require.Nil(t, resp)
+		requireCapturedPanic(t, err)
+	})
+
+	t.Run("UpdateFairnessState", func(t *testing.T) {
+		h := newPanickingTestHandler(t)
+
+		var (
+			resp *matchingservice.UpdateFairnessStateResponse
+			err  error
+		)
+		require.NotPanics(t, func() {
+			resp, err = h.UpdateFairnessState(context.Background(), &matchingservice.UpdateFairnessStateRequest{
+				NamespaceId: "test-ns-id",
+				TaskQueue:   maliciousCursor,
+			})
+		}, "a panic below UpdateFairnessState must not escape the matching handler")
+		require.Nil(t, resp)
+		requireCapturedPanic(t, err)
+	})
+
+	t.Run("UpdateTaskQueueConfig", func(t *testing.T) {
+		h := newPanickingTestHandler(t)
+
+		var (
+			resp *matchingservice.UpdateTaskQueueConfigResponse
+			err  error
+		)
+		require.NotPanics(t, func() {
+			resp, err = h.UpdateTaskQueueConfig(context.Background(), &matchingservice.UpdateTaskQueueConfigRequest{
+				NamespaceId: maliciousCursor,
+			})
+		}, "a panic below UpdateTaskQueueConfig must not escape the matching handler")
+		require.Nil(t, resp)
+		requireCapturedPanic(t, err)
+	})
 }
