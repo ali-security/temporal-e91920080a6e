@@ -17,18 +17,59 @@ import (
 var Module = fx.Module(
 	"component.callbacks",
 	fx.Provide(ConfigProvider),
-	fx.Provide(HTTPCallerProviderProvider),
+	fx.Provide(HTTPCallerProviderProviderWithConfig),
 	fx.Invoke(RegisterTaskSerializers),
 	fx.Invoke(RegisterStateMachine),
 	fx.Invoke(RegisterExecutor),
 )
 
+// HTTPCallerProviderProvider provides an HTTPCallerProvider that inspects the legacy "source"
+// header according to the default value of the callback.inspectSourceHeader setting.
+// Prefer HTTPCallerProviderProviderWithConfig, which honors the dynamically configured value.
 func HTTPCallerProviderProvider(
 	clusterMetadata cluster.Metadata,
 	namespaceRegistry namespace.Registry,
 	rpcFactory common.RPCFactory,
 	httpClientCache *cluster.FrontendHTTPClientCache,
 	logger log.Logger,
+) (HTTPCallerProvider, error) {
+	return newHTTPCallerProvider(
+		clusterMetadata,
+		namespaceRegistry,
+		rpcFactory,
+		httpClientCache,
+		logger,
+		defaultInspectSourceHeader(),
+	)
+}
+
+// HTTPCallerProviderProviderWithConfig provides an HTTPCallerProvider that honors the
+// callback.inspectSourceHeader dynamic config setting.
+func HTTPCallerProviderProviderWithConfig(
+	clusterMetadata cluster.Metadata,
+	namespaceRegistry namespace.Registry,
+	rpcFactory common.RPCFactory,
+	httpClientCache *cluster.FrontendHTTPClientCache,
+	logger log.Logger,
+	config *Config,
+) (HTTPCallerProvider, error) {
+	return newHTTPCallerProvider(
+		clusterMetadata,
+		namespaceRegistry,
+		rpcFactory,
+		httpClientCache,
+		logger,
+		config.InspectSourceHeader(),
+	)
+}
+
+func newHTTPCallerProvider(
+	clusterMetadata cluster.Metadata,
+	namespaceRegistry namespace.Registry,
+	rpcFactory common.RPCFactory,
+	httpClientCache *cluster.FrontendHTTPClientCache,
+	logger log.Logger,
+	inspectSourceHeader bool,
 ) (HTTPCallerProvider, error) {
 	localClient, err := rpcFactory.CreateLocalFrontendHTTPClient()
 	if err != nil {
@@ -47,6 +88,7 @@ func HTTPCallerProviderProvider(
 				defaultClient,
 				localClient,
 				logger,
+				inspectSourceHeader,
 			)
 		}
 	})

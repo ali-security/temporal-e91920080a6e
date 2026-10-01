@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -51,10 +52,83 @@ func TestRouteRequest_ExternalTarget(t *testing.T) {
 		ts.Client(),
 		nil, // localClient not needed for external targets
 		log.NewNoopLogger(),
+		true, // inspectSourceHeader
 	)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestRouteRequest_SourceHeaderIgnored(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ctrl := gomock.NewController(t)
+	clusterMeta := cluster.NewMockMetadata(ctrl)
+
+	r, err := http.NewRequest(http.MethodPost, ts.URL+"/some/path", nil)
+	require.NoError(t, err)
+	r.Header.Set(callbackSourceHeader, "cluster-id-A")
+
+	resp, err := routeRequest(
+		r,
+		clusterMeta,
+		nil,
+		nil,
+		nil,
+		ts.Client(),
+		nil,
+		log.NewNoopLogger(),
+		false,
+	)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestRouteRequest_SourceHeaderDoesNotRouteInternally(t *testing.T) {
+	// Exploit regression: a caller-controlled "source" header must not be able to divert an
+	// external callback to the internal frontend when legacy inspection is disabled.
+	var internalHit atomic.Bool
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHit.Store(true)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer internal.Close()
+
+	var externalHit atomic.Bool
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		externalHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer external.Close()
+
+	ctrl := gomock.NewController(t)
+	clusterMeta := cluster.NewMockMetadata(ctrl)
+
+	r, err := http.NewRequest(http.MethodPost, external.URL+"/some/path", nil)
+	require.NoError(t, err)
+	// Attacker-supplied header naming the local cluster.
+	r.Header.Set(callbackSourceHeader, "cluster-id-A")
+
+	resp, err := routeRequest(
+		r,
+		clusterMeta,
+		nil,
+		nil,
+		nil,
+		external.Client(),
+		newTestFrontendHTTPClient(internal),
+		log.NewNoopLogger(),
+		false, // inspectSourceHeader
+	)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.True(t, externalHit.Load(), "request must be delivered to the external target")
+	require.False(t, internalHit.Load(), "request must not be routed to the internal frontend")
 }
 
 func TestRouteRequest_SourceHeaderLocal(t *testing.T) {
@@ -86,6 +160,7 @@ func TestRouteRequest_SourceHeaderLocal(t *testing.T) {
 		&http.Client{},
 		localClient,
 		log.NewNoopLogger(),
+		true, // inspectSourceHeader
 	)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
@@ -121,6 +196,7 @@ func TestRouteRequest_SourceHeaderUnknownCluster(t *testing.T) {
 		&http.Client{},
 		localClient,
 		log.NewNoopLogger(),
+		true, // inspectSourceHeader
 	)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
@@ -317,6 +393,7 @@ func TestRouteRequest_SystemCallback(t *testing.T) {
 		&http.Client{},
 		localClient,
 		log.NewNoopLogger(),
+		false, // inspectSourceHeader
 	)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()

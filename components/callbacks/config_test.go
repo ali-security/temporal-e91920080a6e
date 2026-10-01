@@ -5,10 +5,18 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	chasmcallbacks "go.temporal.io/server/chasm/lib/callback"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/nexus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestInspectSourceHeaderDefault(t *testing.T) {
+	require.True(t, chasmcallbacks.InspectSourceHeader.Get(dynamicconfig.NewNoopCollection())())
+	require.True(t, defaultInspectSourceHeader())
+	require.True(t, ConfigProvider(dynamicconfig.NewNoopCollection()).InspectSourceHeader())
+}
 
 func Test_addressPatternToRegexp(t *testing.T) {
 	tests := []struct {
