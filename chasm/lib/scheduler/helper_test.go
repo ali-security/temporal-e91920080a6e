@@ -33,6 +33,16 @@ const (
 	defaultCatchupWindow = 5 * time.Minute
 )
 
+// newLegacySpecBuilder builds a legacy SpecBuilder with the given warn/max compute-limit bounds.
+// A value of 0 means "use the default" (GetNextTimeWithError treats a non-positive warn bound as
+// its default and a non-positive max bound as "unbounded").
+func newLegacySpecBuilder(warnIter, maxIter int) *legacyscheduler.SpecBuilder {
+	return legacyscheduler.NewSpecBuilderWithLimits(
+		func() int { return warnIter },
+		func() int { return maxIter },
+	)
+}
+
 // defaultSchedule returns a protobuf definition for a schedule matching this
 // package's other testing defaults.
 func defaultSchedule() *schedulepb.Schedule {

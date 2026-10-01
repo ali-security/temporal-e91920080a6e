@@ -517,6 +517,8 @@ func (s *scheduler) getNextTimeV1(after time.Time) GetNextTimeResult {
 	panicIfErr(workflow.SideEffect(s.ctx, func(ctx workflow.Context) any {
 		results := make(map[time.Time]GetNextTimeResult)
 		for t := after; !t.IsZero() && len(results) < nextTimeCacheV1Size; {
+			// This (pre-cache-v2) path can't represent the compute limit distinctly, so a
+			// limit-exceeded result is treated as end-of-schedule (zero Next stops the loop).
 			next := s.cspec.GetNextTime(s.jitterSeed(), t)
 			results[t] = next
 			t = next.Next
@@ -594,7 +596,19 @@ func (s *scheduler) fillNextTimeCacheV2(start time.Time) {
 			NominalTimes: make([]int64, 0, s.tweakables.NextTimeCacheV2Size),
 		}
 		for t := start; len(cache.NextTimes) < s.tweakables.NextTimeCacheV2Size; {
-			next := s.cspec.GetNextTime(s.jitterSeed(), t)
+			next, err := s.cspec.GetNextTimeWithError(s.jitterSeed(), t)
+			if errors.Is(err, ErrComputeLimitExceeded) {
+				s.metrics.Counter(metrics.ScheduleComputeLimitExceeded.Name()).Inc(1)
+				s.logger.Warn("schedule spec next-time search hit the compute limit; taking no further action until the spec is changed")
+				cache.Completed = true
+				break
+			}
+			if next.ComputeLimitWarning {
+				// Warn (non-fatal) case: the search went long but still resolved. Surface it for
+				// observability and keep scheduling. This is the default protection mode.
+				s.metrics.Counter(metrics.ScheduleComputeLimitWarning.Name()).Inc(1)
+				s.logger.Warn("schedule spec next-time search crossed the warn threshold; continuing (spec may be over-excluded)")
+			}
 			if next.Next.IsZero() {
 				cache.Completed = true
 				break
@@ -1128,7 +1142,13 @@ func (s *scheduler) handleListMatchingTimesQuery(req *workflowservice.ListSchedu
 	t1 := timestamp.TimeValue(req.StartTime)
 	for range maxListMatchingTimesCount {
 		// don't need to call GetNextTime in SideEffect because this is just a query
-		t1 = s.cspec.GetNextTime(s.jitterSeed(), t1).Next
+		res, err := s.cspec.GetNextTimeWithError(s.jitterSeed(), t1)
+		if err != nil {
+			// An over-excluded spec won't resolve until it's edited, so return a
+			// non-retryable code: retrying would just re-burn the compute bound each call.
+			return nil, ErrScheduleSpecLimitHit
+		}
+		t1 = res.Next
 		if t1.IsZero() || t1.After(timestamp.TimeValue(req.EndTime)) {
 			break
 		}

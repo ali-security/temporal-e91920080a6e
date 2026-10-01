@@ -1,15 +1,27 @@
 package scheduler
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
 	schedulepb "go.temporal.io/api/schedule/v1"
+	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/testing/protorequire"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// newSpecBuilderForTest builds a SpecBuilder with the given warn/max compute-limit bounds. A value
+// of 0 means "use the default": a non-positive warn bound falls back to DefaultWarnIterations and a
+// non-positive max bound disables the hard limit.
+func newSpecBuilderForTest(warnIter, maxIter int) *SpecBuilder {
+	return NewSpecBuilderWithLimits(
+		func() int { return warnIter },
+		func() int { return maxIter },
+	)
+}
 
 type specSuite struct {
 	suite.Suite
@@ -376,7 +388,93 @@ func (s *specSuite) TestExcludeAll() {
 		},
 	})
 	s.NoError(err)
+	result, err := cs.GetNextTimeWithError("", time.Date(2022, 3, 23, 12, 53, 2, 9, time.UTC))
+	s.Require().NoError(err)
+	s.Zero(result)
 	s.Zero(cs.GetNextTime("", time.Date(2022, 3, 23, 12, 53, 2, 9, time.UTC)))
+}
+
+func (s *specSuite) TestGetNextTimeComputeLimitExceeded() {
+	// Mirrored calendar/exclude: every candidate is excluded, so the search hits the bound.
+	// Without the bound this loop runs one second at a time up to maxCalendarYear, which is
+	// the unbounded-loop DoS this guards against.
+	const iterations = 10_000
+	builder := newSpecBuilderForTest(0, iterations)
+	cs, err := builder.NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Calendar:        []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+		ExcludeCalendar: []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+	})
+	s.Require().NoError(err)
+
+	after := time.Date(2022, 3, 23, 12, 0, 0, 0, time.UTC)
+	_, err = cs.GetNextTimeWithError("", after)
+
+	s.Require().ErrorIs(err, ErrComputeLimitExceeded)
+
+	// The signature-preserving GetNextTime swallows the error and degrades to "no next time",
+	// which is what the pre-existing (error-less) call sites see.
+	s.True(cs.GetNextTime("", after).Next.IsZero())
+}
+
+func (s *specSuite) TestGetNextTimeComputeLimitWarning() {
+	// Mirrored calendar/exclude means every candidate is excluded. With the hard limit disabled
+	// the search does not error; it crosses the warn threshold and keeps searching until the
+	// spec's end time, then returns no match. A short end time keeps the scan bounded for the
+	// test.
+	start := time.Date(2022, 3, 23, 12, 0, 0, 0, time.UTC)
+	builder := newSpecBuilderForTest(5, 0)
+	cs, err := builder.NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Calendar:        []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+		ExcludeCalendar: []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+		EndTime:         timestamppb.New(start.Add(30 * time.Second)),
+	})
+	s.Require().NoError(err)
+
+	result, err := cs.GetNextTimeWithError("", start)
+	s.Require().NoError(err, "crossing the warn threshold must not error; the hard limit is disabled")
+	s.True(result.ComputeLimitWarning, "search should flag that it crossed the warn threshold")
+	s.True(result.Next.IsZero(), "an over-excluded spec resolves to no next time")
+}
+
+func (s *specSuite) TestGetNextTimeComputeLimitWarningThenResolves() {
+	// Calendar matches every second; exclude matches every second EXCEPT :59. The search skips
+	// the excluded seconds (crossing the small warn threshold) and then resolves to a real time.
+	// This exercises the success return path carrying ComputeLimitWarning=true (as opposed to the
+	// no-match path in TestGetNextTimeComputeLimitWarning).
+	start := time.Date(2022, 3, 23, 12, 0, 0, 0, time.UTC)
+	builder := newSpecBuilderForTest(5, 0)
+	cs, err := builder.NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Calendar:        []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+		ExcludeCalendar: []*schedulepb.CalendarSpec{{Second: "0-58", Minute: "*", Hour: "*"}},
+	})
+	s.Require().NoError(err)
+
+	result, err := cs.GetNextTimeWithError("", start)
+	s.Require().NoError(err)
+	s.True(result.ComputeLimitWarning, "crossing the warn threshold should be flagged even when the search resolves")
+	s.Require().False(result.Next.IsZero(), "the search should resolve to a real next time")
+	s.Equal(59, result.Nominal.Second(), "the only non-excluded second is :59")
+}
+
+// TestDefaultSpecBuilderIsBounded asserts that the zero-argument NewSpecBuilder (used by the
+// schedule workflow and by any external caller of the exported constructor) is bounded by the
+// dynamic config defaults rather than being unlimited. The behaviour at the bound is covered by
+// TestGetNextTimeComputeLimitExceeded with a small bound; here we only check the wiring, since
+// actually walking the ~1.2M candidate times of the default bound would make the suite needlessly
+// slow.
+func (s *specSuite) TestDefaultSpecBuilderIsBounded() {
+	cs, err := NewSpecBuilder().NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Calendar: []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+	})
+	s.Require().NoError(err)
+
+	dc := dynamicconfig.NewNoopCollection()
+	s.Equal(dynamicconfig.SchedulerSpecMaxIterations.Get(dc)(), cs.limits.hardLimit(),
+		"the default hard bound must be SchedulerSpecMaxIterations, not unlimited")
+	s.Less(cs.limits.hardLimit(), math.MaxInt,
+		"an unbounded default would leave the exclusion loop able to spin to maxCalendarYear")
+	s.Equal(dynamicconfig.SchedulerSpecWarnIterations.Get(dc)(), cs.limits.warnThreshold())
+	s.Equal(DefaultWarnIterations, cs.limits.warnThreshold())
 }
 
 func (s *specSuite) TestSpecStartTime() {

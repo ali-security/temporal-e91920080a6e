@@ -17,6 +17,7 @@ import (
 	sdkpb "go.temporal.io/api/sdk/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 	schedulespb "go.temporal.io/server/api/schedule/v1"
@@ -2577,4 +2578,52 @@ func (s *workflowSuite) TestMigrateDynamicConfigDisabledNoMigration() {
 	// Workflow should CAN normally without attempting migration.
 	s.True(s.env.IsWorkflowCompleted())
 	s.True(workflow.IsContinueAsNewError(s.env.GetWorkflowError()))
+}
+
+// TestListMatchingTimesComputeLimitExceeded feeds the legacy (workflow-based) scheduler a mirrored
+// include/exclude spec: the calendar matches every second and the exclude calendar blocks every
+// second, so no candidate time is ever accepted. Before the compute bound existed, the
+// listMatchingTimes query loop scanned one second at a time all the way to maxCalendarYear
+// (billions of iterations), pinning a CPU for the lifetime of the query. With the bound in place
+// the query fails fast and non-retryably.
+func (s *workflowSuite) TestListMatchingTimesComputeLimitExceeded() {
+	const maxIterations = 1000
+	builder := newSpecBuilderForTest(0, maxIterations)
+	cspec, err := builder.NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Calendar:        []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+		ExcludeCalendar: []*schedulepb.CalendarSpec{{Second: "*", Minute: "*", Hour: "*"}},
+	})
+	s.Require().NoError(err)
+
+	sched := &scheduler{
+		StartScheduleArgs: &schedulespb.StartScheduleArgs{
+			State: &schedulespb.InternalState{
+				Namespace:   "myns",
+				NamespaceId: "mynsid",
+				ScheduleId:  "myschedule",
+			},
+		},
+		tweakables: CurrentTweakablePolicies,
+		cspec:      cspec,
+	}
+
+	start := time.Date(2022, 3, 23, 12, 0, 0, 0, time.UTC)
+	req := &workflowservice.ListScheduleMatchingTimesRequest{
+		StartTime: timestamppb.New(start),
+		EndTime:   timestamppb.New(start.Add(time.Hour)),
+	}
+
+	_, err = sched.handleListMatchingTimesQuery(req)
+	s.Require().Error(err, "an over-excluded spec must not spin forever")
+	s.Require().ErrorIs(err, ErrScheduleSpecLimitHit)
+
+	// A well-formed spec is unaffected and still enumerates matching times.
+	sched.cspec, err = builder.NewCompiledSpec(&schedulepb.ScheduleSpec{
+		Interval: []*schedulepb.IntervalSpec{{Interval: durationpb.New(time.Minute)}},
+	})
+	s.Require().NoError(err)
+
+	resp, err := sched.handleListMatchingTimesQuery(req)
+	s.Require().NoError(err)
+	s.Len(resp.StartTime, 60)
 }

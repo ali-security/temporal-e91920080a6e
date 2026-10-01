@@ -2,8 +2,10 @@ package scheduler_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	schedulepb "go.temporal.io/api/schedule/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/chasm"
@@ -11,6 +13,7 @@ import (
 	schedulerpb "go.temporal.io/server/chasm/lib/scheduler/gen/schedulerpb/v1"
 	legacyscheduler "go.temporal.io/server/service/worker/scheduler"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -56,6 +59,55 @@ func TestSentinelHandler_ListScheduleMatchingTimes(t *testing.T) {
 		}, specBuilder)
 		return err
 	})
+}
+
+// TestScheduler_ListMatchingTimes_ComputeLimitExceeded feeds the CHASM scheduler a mirrored
+// include/exclude spec: the calendar matches every second and the exclude calendar blocks every
+// second, so no candidate time is ever accepted. Before the compute bound existed, the
+// ListScheduleMatchingTimes exclusion loop kept scanning one second at a time until
+// maxCalendarYear (billions of iterations), pinning a CPU for the lifetime of the request. With
+// the bound in place the request fails fast and non-retryably.
+func TestScheduler_ListMatchingTimes_ComputeLimitExceeded(t *testing.T) {
+	sched, ctx, _ := setupSchedulerForTest(t)
+
+	everySecond := &schedulepb.CalendarSpec{Second: "*", Minute: "*", Hour: "*"}
+	sched.Schedule.Spec = &schedulepb.ScheduleSpec{
+		Calendar:        []*schedulepb.CalendarSpec{everySecond},
+		ExcludeCalendar: []*schedulepb.CalendarSpec{everySecond},
+	}
+	// Bust the spec compiled from the default (interval) schedule, which is cached on the
+	// component and keyed off the conflict token.
+	sched.ConflictToken++
+
+	specBuilder := newLegacySpecBuilder(0, 1000)
+	start := time.Now().UTC()
+	listReq := func() *schedulerpb.ListScheduleMatchingTimesRequest {
+		return &schedulerpb.ListScheduleMatchingTimesRequest{
+			NamespaceId: namespaceID,
+			FrontendRequest: &workflowservice.ListScheduleMatchingTimesRequest{
+				Namespace:  namespace,
+				ScheduleId: scheduleID,
+				StartTime:  timestamppb.New(start),
+				EndTime:    timestamppb.New(start.Add(time.Hour)),
+			},
+		}
+	}
+
+	_, err := sched.ListMatchingTimes(ctx, listReq(), specBuilder)
+	require.Error(t, err, "an over-excluded spec must not spin forever")
+	require.ErrorIs(t, err, legacyscheduler.ErrScheduleSpecLimitHit)
+	var invalidArgErr *serviceerror.InvalidArgument
+	require.ErrorAs(t, err, &invalidArgErr, "the compute limit must be reported as non-retryable")
+
+	// A well-formed spec is unaffected and still enumerates matching times.
+	sched.Schedule.Spec = &schedulepb.ScheduleSpec{
+		Interval: []*schedulepb.IntervalSpec{{Interval: durationpb.New(time.Minute)}},
+	}
+	sched.ConflictToken++
+
+	resp, err := sched.ListMatchingTimes(ctx, listReq(), specBuilder)
+	require.NoError(t, err)
+	require.Len(t, resp.FrontendResponse.GetStartTime(), 60)
 }
 
 func TestSentinelHandler_UpdateSchedule(t *testing.T) {
